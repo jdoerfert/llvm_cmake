@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLVM CMake Architect</title>
+    <style>
+        :root { --bg: #f4f4f9; --panel: #ffffff; --primary: #0052cc; --text: #333; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: var(--panel); padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; color: var(--primary); border-bottom: 2px solid var(--bg); padding-bottom: 10px; }
+        .section { margin-bottom: 20px; }
+        label { display: block; font-weight: bold; margin-bottom: 5px; }
+        select, input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .grid-list { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; font-size: 0.9em; }
+        .output-box { grid-column: span 2; background: #282c34; color: #abb2bf; padding: 20px; border-radius: 8px; font-family: monospace; position: relative; }
+        .output-box header { color: #56b6c2; margin-bottom: 10px; font-weight: bold; border-bottom: 1px solid #3e4451; }
+        .explanation { font-size: 0.85em; color: #666; font-style: italic; margin-top: 5px; }
+        .badge { background: #eef; color: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+
+<h1>LLVM CMake Architect</h1>
+<p>Configure LLVM, Clang, Flang, and GPU Runtimes with ease.</p>
+
+<div class="container">
+    <div class="card">
+        <h2>1. Configure Build</h2>
+        
+        <div class="section">
+            <label>Persona</label>
+            <select id="persona" onchange="update()">
+                <option value="user">Standard User (Release, No Assertions)</option>
+                <option value="developer">Compiler Developer (Debug, Assertions ON)</option>
+            </select>
+        </div>
+
+        <div class="section">
+            <label>Base Variant (Caches)</label>
+            <select id="variant" onchange="applyVariant()">
+                <option value="none">None (Manual Configuration)</option>
+                <option value="offload">Offload (offload/cmake/caches/Offload.cmake)</option>
+                <option value="flang">Flang Offload (offload/cmake/caches/FlangOffload.cmake)</option>
+            </select>
+        </div>
+
+        <div class="section">
+            <label>GPU Target</label>
+            <select id="gpu" onchange="update()">
+                <option value="none">None</option>
+                <option value="AMDGPU">AMD GPU</option>
+                <option value="NVPTX">NVIDIA GPU</option>
+                <option value="INTEL">Intel GPU (SPIR-V)</option>
+            </select>
+            <input type="text" id="subarch" placeholder="Sub-arch (e.g. sm_80, gfx90a)" oninput="update()" style="margin-top:5px">
+        </div>
+
+        <div class="section">
+            <label>Projects</label>
+            <div class="grid-list" id="projects-list"></div>
+        </div>
+
+        <div class="section">
+            <label>Runtimes</label>
+            <div class="grid-list" id="runtimes-list"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>2. Analyze & Explain</h2>
+        <textarea id="analyzer-input" rows="10" placeholder="Paste a cmake command here to analyze its effect..." oninput="analyze()"></textarea>
+        <div id="analysis-output" style="margin-top:15px"></div>
+    </div>
+
+    <div class="output-box">
+        <header>Generated CMake Invocation</header>
+        <code id="final-cmd"></code>
+    </div>
+</div>
+
+<script>
+    const projects = ["bolt", "clang", "clang-tools-extra", "compiler-rt", "flang", "libc", "libclc", "lld", "lldb", "mlir", "openmp", "polly"];
+    const runtimes = ["libc", "libunwind", "libcxx", "libcxxabi", "compiler-rt", "openmp", "offload"];
+    
+    // Initialize lists
+    function init() {
+        const pList = document.getElementById('projects-list');
+        const rList = document.getElementById('runtimes-list');
+        projects.forEach(p => pList.innerHTML += `<span><input type="checkbox" class="proj-check" value="${p}" onchange="update()"> ${p}</span>`);
+        runtimes.forEach(r => rList.innerHTML += `<span><input type="checkbox" class="run-check" value="${r}" onchange="update()"> ${r}</span>`);
+        update();
+    }
+
+    function applyVariant() {
+        const variant = document.getElementById('variant').value;
+        const projChecks = document.querySelectorAll('.proj-check');
+        const runChecks = document.querySelectorAll('.run-check');
+        
+        // Reset
+        projChecks.forEach(c => c.checked = false);
+        runChecks.forEach(c => c.checked = false);
+
+        if (variant === 'offload') {
+            ['clang', 'lld', 'openmp'].forEach(p => setCheck('.proj-check', p));
+            ['openmp', 'offload'].forEach(r => setCheck('.run-check', r));
+        } else if (variant === 'flang') {
+            ['clang', 'flang', 'lld', 'mlir', 'openmp'].forEach(p => setCheck('.proj-check', p));
+            ['openmp', 'offload'].forEach(r => setCheck('.run-check', r));
+        }
+        update();
+    }
+
+    function setCheck(selector, val) {
+        document.querySelectorAll(selector).forEach(c => { if(c.value === val) c.checked = true; });
+    }
+
+    function update() {
+        const persona = document.getElementById('persona').value;
+        const variant = document.getElementById('variant').value;
+        const gpu = document.getElementById('gpu').value;
+        const subarch = document.getElementById('subarch').value;
+        
+        let selectedProjs = Array.from(document.querySelectorAll('.proj-check:checked')).map(c => c.value);
+        let selectedRuns = Array.from(document.querySelectorAll('.run-check:checked')).map(c => c.value);
+        
+        let cmd = "cmake -G Ninja -S ../llvm -B . \\\n";
+
+        if (variant === 'offload') cmd += "  -C ../offload/cmake/caches/Offload.cmake \\\n";
+        if (variant === 'flang') cmd += "  -C ../offload/cmake/caches/FlangOffload.cmake \\\n";
+
+        // Persona Logic
+        if (persona === 'developer') {
+            cmd += "  -DCMAKE_BUILD_TYPE=Debug -DLLVM_ENABLE_ASSERTIONS=ON \\\n";
+        } else {
+            cmd += "  -DCMAKE_BUILD_TYPE=Release \\\n";
+        }
+
+        // Targets
+        let targets = "host";
+        if (gpu === 'AMDGPU') targets += ";AMDGPU";
+        if (gpu === 'NVPTX') targets += ";NVPTX";
+        cmd += `  -DLLVM_TARGETS_TO_BUILD="${targets}" \\\n`;
+
+        // Projects & Runtimes
+        if (selectedProjs.length > 0) cmd += `  -DLLVM_ENABLE_PROJECTS="${selectedProjs.join(';')}" \\\n`;
+        if (selectedRuns.length > 0) cmd += `  -DLLVM_ENABLE_RUNTIMES="${selectedRuns.join(';')}" \\\n`;
+
+        // GPU C Library Logic
+        if (gpu !== 'none') {
+            cmd += `  -DLIBC_GPU_BUILD=ON -DLLVM_LIBC_FULL_BUILD=ON \\\n`;
+            let triple = gpu === 'AMDGPU' ? 'amdgcn-amd-amdhsa' : (gpu === 'NVPTX' ? 'nvptx64-nvidia-cuda' : 'spirv64-intel-unknown');
+            cmd += `  -DRUNTIMES_${triple}_LLVM_ENABLE_RUNTIMES="libc" \\\n`;
+            if (subarch) cmd += `  -DLIBC_GPU_TEST_ARCHITECTURE=${subarch} \\\n`;
+        }
+
+        document.getElementById('final-cmd').innerText = cmd.trim().replace(/\\\n$/, "");
+    }
+
+    function analyze() {
+        const input = document.getElementById('analyzer-input').value;
+        const output = document.getElementById('analysis-output');
+        let html = "<ul>";
+
+        if (input.includes("Debug")) html += "<li><span class='badge'>Dev</span> <b>Debug Build:</b> Includes symbols for debugging with GDB/LLDB.</li>";
+        if (input.includes("flang") && !input.includes("mlir")) html += "<li>⚠️ <b>Warning:</b> Flang requires MLIR to be enabled in projects.</li>";
+        if (input.includes("LIBC_GPU_BUILD")) html += "<li><span class='badge'>GPU</span> <b>GPU C Library:</b> Building a cross-compiled libc for accelerators.</li>";
+        if (input.includes("-C ")) html += "<li><span class='badge'>Cache</span> <b>Cache File:</b> Using a pre-defined LLVM configuration script.</li>";
+        
+        output.innerHTML = html + "</ul>";
+    }
+
+    init();
+</script>
+</body>
+</html>
